@@ -1,78 +1,59 @@
 #!/usr/bin/env python3
-# app.py - servidor Flask para reconocimiento facial
+# app.py - Servidor Flask de reconocimiento facial (Raspberry Pi Zero 2W)
+
 import os
 import io
+import cv2
+import numpy as np
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
-import face_recognition
 from PIL import Image
-import numpy as np
 
-# Optional: Telegram notifications
-try:
-    import telegram
-except Exception:
-    telegram = None
+# ================== CONFIG ==================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# CONFIG
-KNOWN_DIR = "known_faces"
-LOG_DIR = "logs"
-TELEGRAM_TOKEN = os.environ.get("7998500572:AAFCKRu1cITqLfJF_kB6neVoodaxzZmFR-c", "")    # set via env var (recommended)
-TELEGRAM_CHAT_ID = os.environ.get("5998082378", "")  # set via env var
+KNOWN_DIR = os.path.join(BASE_DIR, "known_faces")
+LOG_DIR   = os.path.join(BASE_DIR, "logs")
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 
-# Create folders if not exist
+DETECTOR_PROTO = os.path.join(MODEL_DIR, "deploy.prototxt")
+DETECTOR_MODEL = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
+RECOGNIZER_MODEL = os.path.join(MODEL_DIR, "face_recognition_sface_2021dec.onnx")
+
+SIMILARITY_THRESHOLD = 0.55  # recomendado: 0.5–0.65
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ============================================
+
 os.makedirs(KNOWN_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 app = Flask(__name__)
 
-bot = None
-if telegram and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-    try:
-        bot = telegram.Bot(token=TELEGRAM_TOKEN)
-    except Exception as e:
-        print("Telegram init error:", e)
-        bot = None
+# ================== TELEGRAM ==================
+try:
+    import telegram
+    bot = telegram.Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID else None
+except Exception:
+    bot = None
 
-# In-memory encodings
-known_encodings = []
-known_names = []
-
-def load_known_faces():
-    """Carga todas las imágenes en KNOWN_DIR y calcula encodings."""
-    global known_encodings, known_names
-    known_encodings = []
-    known_names = []
-    for fname in os.listdir(KNOWN_DIR):
-        path = os.path.join(KNOWN_DIR, fname)
-        if not os.path.isfile(path):
-            continue
-        name, ext = os.path.splitext(fname)
-        if ext.lower() not in [".jpg", ".jpeg", ".png"]:
-            continue
-        try:
-            image = face_recognition.load_image_file(path)
-            encs = face_recognition.face_encodings(image)
-            if len(encs) > 0:
-                known_encodings.append(encs[0])
-                known_names.append(name)
-                print(f"Loaded: {name}")
-            else:
-                print(f"No face found in {fname}, skipping.")
-        except Exception as e:
-            print(f"Error loading {fname}: {e}")
-
-load_known_faces()
-
-def notify_telegram(text):
+def notify_telegram(msg):
     if bot:
         try:
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         except Exception as e:
-            print("Telegram send error:", e)
+            print("Telegram error:", e)
 
-def save_attempt_image(img_bytes, prefix="attempt"):
-    """Guarda la imagen recibida en logs con timestamp y devuelve el path."""
+# ================== MODELOS ==================
+print("📦 Cargando modelos...")
+face_detector = cv2.dnn.readNetFromCaffe(DETECTOR_PROTO, DETECTOR_MODEL)
+face_recognizer = cv2.dnn.readNetFromONNX(RECOGNIZER_MODEL)
+print("✅ Modelos cargados")
+
+# ================== UTILIDADES ==================
+def save_attempt(img_bytes, prefix="recv"):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"{prefix}_{ts}.jpg"
     path = os.path.join(LOG_DIR, fname)
@@ -80,114 +61,153 @@ def save_attempt_image(img_bytes, prefix="attempt"):
         f.write(img_bytes)
     return path
 
+def detect_face(image):
+    h, w = image.shape[:2]
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(image, (300, 300)),
+        1.0,
+        (300, 300),
+        (104.0, 177.0, 123.0)
+    )
+
+    face_detector.setInput(blob)
+    detections = face_detector.forward()
+
+    best_conf = 0
+    best_box = None
+
+    for i in range(detections.shape[2]):
+        conf = detections[0, 0, i, 2]
+        if conf > 0.6 and conf > best_conf:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            best_box = box.astype("int")
+            best_conf = conf
+
+    return best_box
+
+def extract_embedding(image):
+    box = detect_face(image)
+    if box is None:
+        return None
+
+    x1, y1, x2, y2 = box
+    face = image[y1:y2, x1:x2]
+
+    if face.size == 0:
+        return None
+
+    face = cv2.resize(face, (112, 112))
+    blob = cv2.dnn.blobFromImage(
+        face,
+        1.0 / 255,
+        (112, 112),
+        (0, 0, 0),
+        swapRB=True,
+        crop=False
+    )
+
+    face_recognizer.setInput(blob)
+    emb = face_recognizer.forward()
+    return emb.flatten()
+
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+# ================== BASE DE DATOS EN MEMORIA ==================
+known_embeddings = []
+known_names = []
+
+def load_known_faces():
+    global known_embeddings, known_names
+    known_embeddings = []
+    known_names = []
+
+    for fname in os.listdir(KNOWN_DIR):
+        path = os.path.join(KNOWN_DIR, fname)
+        name, ext = os.path.splitext(fname)
+
+        if ext.lower() not in [".jpg", ".jpeg", ".png"]:
+            continue
+
+        img = cv2.imread(path)
+        if img is None:
+            continue
+
+        emb = extract_embedding(img)
+        if emb is not None:
+            known_embeddings.append(emb)
+            known_names.append(name)
+            print(f"✔ Rostro cargado: {name}")
+        else:
+            print(f"⚠ No se detectó rostro en {fname}")
+
+load_known_faces()
+
+# ================== ENDPOINTS ==================
 @app.route("/known", methods=["GET"])
 def list_known():
     return jsonify({"known": known_names})
 
 @app.route("/register", methods=["POST"])
 def register():
-    """
-    Registrar una nueva cara:
-    - form-data 'name' (string)
-    - form-data 'image' (file)
-    """
-    name = request.form.get("name", None)
-    file = request.files.get("image", None)
+    name = request.form.get("name")
+    file = request.files.get("image")
+
     if not name or not file:
         return jsonify({"error": "name and image required"}), 400
 
-    # sanitize name (no spaces)
-    name_clean = name.strip().replace(" ", "_")
-    ext = os.path.splitext(file.filename)[1] or ".jpg"
-    save_path = os.path.join(KNOWN_DIR, f"{name_clean}{ext}")
-    file.save(save_path)
+    name = name.strip().replace(" ", "_")
+    path = os.path.join(KNOWN_DIR, f"{name}.jpg")
+    file.save(path)
 
-    # try to compute encoding to verify
-    try:
-        image = face_recognition.load_image_file(save_path)
-        encs = face_recognition.face_encodings(image)
-        if len(encs) == 0:
-            # remove file
-            os.remove(save_path)
-            return jsonify({"error": "no_face_found"}), 400
-    except Exception as e:
-        return jsonify({"error": f"error_processing_image: {e}"}), 500
+    img = cv2.imread(path)
+    emb = extract_embedding(img)
+
+    if emb is None:
+        os.remove(path)
+        return jsonify({"error": "no_face_detected"}), 400
 
     load_known_faces()
-    notify_telegram(f"[{datetime.now()}] Nuevo registro: {name_clean}")
-    return jsonify({"status": "ok", "name": name_clean})
+    notify_telegram(f"📌 Nuevo rostro registrado: {name}")
+    return jsonify({"status": "ok", "name": name})
 
 @app.route("/recognize", methods=["POST"])
 def recognize():
-    """
-    Endpoint principal que acepta:
-    - raw image/jpeg in body (Content-Type: image/jpeg)  <-- used by your ESP32 code
-    - OR multipart/form-data with 'image' file and optional 'action' <-- alternative
-    Returns JSON:
-      {"authorized": true/false, "name": <name or null>, "reason": ...}
-    """
-    # 1) get image bytes either raw or multipart
-    img_bytes = None
-    action = None
-    if request.content_type and request.content_type.startswith("image/"):
-        # raw JPEG posted
-        img_bytes = request.get_data()
-    else:
-        # try multipart form
-        action = request.form.get("action", None)
-        file = request.files.get("image", None)
-        if file:
-            img_bytes = file.read()
-        else:
-            return jsonify({"error": "no image provided"}), 400
+    img_bytes = request.get_data()
+    save_attempt(img_bytes)
 
-    # save attempt for logging
-    saved = save_attempt_image(img_bytes, prefix="recv")
+    img = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # load image into face_recognition
-    try:
-        image = face_recognition.load_image_file(io.BytesIO(img_bytes))
-    except Exception as e:
-        notify_telegram(f"[{datetime.now()}] Error leyendo imagen: {e}")
-        return jsonify({"error": "invalid_image"}), 400
+    emb = extract_embedding(img)
+    if emb is None:
+        notify_telegram("🚫 No se detectó rostro")
+        return jsonify({"authorized": False, "reason": "no_face"})
 
-    face_locations = face_recognition.face_locations(image)
-    face_encodings = face_recognition.face_encodings(image, face_locations)
+    if not known_embeddings:
+        return jsonify({"authorized": False, "reason": "no_known_faces"})
 
-    if len(face_encodings) == 0:
-        notify_telegram(f"[{datetime.now()}] No face detected. Action={action}")
-        return jsonify({"authorized": False, "reason": "no_face", "name": None})
+    similarities = [cosine_similarity(emb, k) for k in known_embeddings]
+    best_idx = int(np.argmax(similarities))
+    best_score = similarities[best_idx]
 
-    # compare first face to known encodings
-    encoding = face_encodings[0]
-    if len(known_encodings) == 0:
-        # no known faces
-        notify_telegram(f"[{datetime.now()}] No known faces in DB.")
-        return jsonify({"authorized": False, "reason": "no_known_faces", "name": None})
-
-    matches = face_recognition.compare_faces(known_encodings, encoding, tolerance=0.5)
-    distances = face_recognition.face_distance(known_encodings, encoding)
-
-    best_idx = None
-    if any(matches):
-        best_idx = int(np.argmin(distances))
+    if best_score >= SIMILARITY_THRESHOLD:
         name = known_names[best_idx]
-        notify_telegram(f"[{datetime.now()}] Autorizado: {name} (dist={distances[best_idx]:.3f})")
-        return jsonify({"authorized": True, "name": name, "distance": float(distances[best_idx])})
+        notify_telegram(f"✅ Acceso autorizado: {name} ({best_score:.2f})")
+        return jsonify({"authorized":True, "name": name, "score": float(best_score)})
     else:
-        notify_telegram(f"[{datetime.now()}] Intento NO autorizado (dist_min={float(np.min(distances)) if len(distances)>0 else 'n/a'})")
-        return jsonify({"authorized": False, "name": None, "reason": "not_matched"})
+        notify_telegram(f"❌ Acceso denegado ({best_score:.2f})")
+        return jsonify({"authorized": False, "reason": "not_matched"})
 
-# (optional) download known image
 @app.route("/known/<name>", methods=["GET"])
 def get_known(name):
-    # returns file if exists
     for fname in os.listdir(KNOWN_DIR):
         n, ext = os.path.splitext(fname)
         if n == name:
             return send_from_directory(KNOWN_DIR, fname)
     return jsonify({"error": "not_found"}), 404
 
+# ================== MAIN ==================
 if __name__ == "__main__":
-    # Run on all interfaces so ESP32 can reach it
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print("🚀 Servidor iniciado en puerto 5000")
+    app.run(host="0.0.0.0", port=5000)
