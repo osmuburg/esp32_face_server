@@ -1,40 +1,20 @@
-# 1. Actualizar
-sudo apt update && sudo apt upgrade -y
+# 1. Dirigirse a la carpeta del proyecto
+cd ~/esp32_face_server
 
-# 2. Instalar herramientas básicas
-sudo apt install -y build-essential cmake libopenblas-dev liblapack-dev libx11-dev libgtk2.0-dev pkg-config
+# 2. Enviar la IP del servidor a la ESP32-CAM
+python3 send_ip_uart.py
 
-# 3. Instalar Python para utilizar dlib (necesario para face_recognition), se recomienda instalar pip en un entorno virtual
-sudo apt install -y python3-pip python3-venv
+NOTA: Solo ejecutar este comando si la IP del servidor no coincide con la IP que retorna el comando /ip en el chatboot.
+Presione Ctrl + C luego que se envié la dirección IP
 
-# 4. Crear entorno python en tu carpeta de proyecto
-mkdir -p ~/esp32_face_server && cd ~/esp32_face_server
-python3 -m venv venv
-
-# 5. Activar el entorno virtual
-source venv/bin/activate
-
-# 6. Instalar dependencias de imagen y OpenCV build (versión simple)
-sudo apt install -y libjpeg-dev libpng-dev libtiff-dev libavcodec-dev libavformat-dev libswscale-dev
-
-# 7. Instalar wheel y actualizaciones pip
-pip install --upgrade pip setuptools wheel
-
-# 8. Instalar dependencias principales
-pip install dlib
-pip install face_recognition flask opencv-python numpy pillow python-telegram-bot
-
-# 9. Crear el archivo app.py
-touch app.py # o sudo nano app.py
-
-# 10. Ejecutar el servidor Flask
+# 3. Ejecutar el servidor Flask
 python app.py
 
-# 11. Añadir imagenes de personas autorizadas desde la terminal
+# 4. Añadir imagenes de personas autorizadas desde la terminal
 curl -X POST -F "name=PERSONA" -F "image=@foto.jpg" http://<ip_del_servidor>:5000/register
 
-# 12. Verificar listado de personas con sus rostros autorizados
-curl http://192.168.100.11:5000/known
+# 5. Verificar listado de personas con sus rostros autorizados
+curl http://<ip_del_servidor>:5000/known
 
-# 13. Probar reconocimiento con raw JPEG (sin la ESP)
+# 6. Probar reconocimiento con raw JPEG (sin la ESP)
 curl -X POST --data-binary "@PERSONA.jpg" -H "Content-Type: image/jpeg" http://<ip_del_servidor>:5000/recognize
